@@ -2887,6 +2887,22 @@ WORKDIR /build
 RUN curl --retry-all-errors -fL --retry 5 https://github.com/i3/i3lock/archive/refs/tags/${I3LOCK_VERSION}.tar.gz -o i3lock.tar.gz && \
     tar -xf i3lock.tar.gz && mv i3lock-* src
 WORKDIR /build/src
+# The unlock indicator is hidden until the first key press, so a locked screen
+# is a flat colour that looks like a sleeping display. Draw the ring from the
+# start, and make it, with its text, about a fifth smaller than upstream's 90 px
+# radius: on a small screen the stock ring takes a quarter of the height. i3lock
+# has no option for either, so the two constants are edited here; the greps fail
+# the build if a new release moves them.
+RUN sed -i \
+      -e 's/#define BUTTON_RADIUS 90/#define BUTTON_RADIUS 70/' \
+      -e 's/(unlock_state >= STATE_KEY_PRESSED || auth_state > STATE_AUTH_IDLE)) {/true) {/' \
+      -e 's/cairo_set_font_size(ctx, 28.0)/cairo_set_font_size(ctx, 22.0)/' \
+      -e 's/cairo_set_font_size(ctx, 32.0)/cairo_set_font_size(ctx, 25.0)/' \
+      unlock_indicator.c && \
+    grep -q 'BUTTON_RADIUS 70' unlock_indicator.c && \
+    grep -q 'font_size(ctx, 22.0)' unlock_indicator.c && \
+    grep -q 'font_size(ctx, 25.0)' unlock_indicator.c && \
+    ! grep -q 'STATE_KEY_PRESSED ||' unlock_indicator.c
 RUN pip3 install meson ninja
 RUN meson setup buildDir ${COMMON_MESON_FLAGS}
 RUN DESTDIR=/i3lock ninja -C buildDir install
