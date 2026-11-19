@@ -281,11 +281,22 @@ func (e configEnv) lock() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
+	// Never wait for it longer than the boot waits for this command.
+	limit := time.Now().Add(10 * time.Second)
+	if !e.Until.IsZero() && e.Until.Before(limit) {
+		limit = e.Until
 	}
-	return func() { f.Close() }, nil
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { f.Close() }, nil
+		}
+		if err != syscall.EWOULDBLOCK || !time.Now().Before(limit) {
+			f.Close()
+			return nil, errors.New("another isotope config command is changing the config")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // save records the files as a new generation and keeps a copy of each file
@@ -360,11 +371,26 @@ func (e configEnv) prune() {
 // configKeepRejected is how many sets of replaced files stay.
 const configKeepRejected = 10
 
+// newSet names the directory for the files one command replaces: a number
+// that only goes up, so two commands in one second, or a clock that is wrong
+// early in a boot, never share a set or change which one is the oldest.
+func (e configEnv) newSet() string {
+	seq := 0
+	sets, _ := os.ReadDir(filepath.Join(e.real(e.State), "rejected"))
+	for _, s := range sets {
+		num, _, _ := strings.Cut(s.Name(), "-")
+		if n, err := strconv.Atoi(num); err == nil && n > seq {
+			seq = n
+		}
+	}
+	return fmt.Sprintf("%06d-%s", seq+1, e.Now().UTC().Format("20060102-150405"))
+}
+
 // pruneRejected drops the oldest sets of replaced files, and starts the log
 // again when it is large. The OEM partition is small.
 func (e configEnv) pruneRejected() {
 	dir := filepath.Join(e.real(e.State), "rejected")
-	sets, _ := os.ReadDir(dir) // by name, and the names are times
+	sets, _ := os.ReadDir(dir) // by name, and a name starts with its number
 	for len(sets) > configKeepRejected {
 		os.RemoveAll(filepath.Join(dir, sets[0].Name()))
 		sets = sets[1:]
@@ -428,7 +454,7 @@ func (e configEnv) restoreSet(g *generation, stage string) ([]guardEvent, error)
 	if err != nil {
 		return nil, err
 	}
-	stamp := e.Now().UTC().Format("20060102-150405")
+	stamp := e.newSet()
 	want := byPath(writable(g.Files))
 	have := byPath(writable(cur))
 	var events []guardEvent
@@ -696,6 +722,13 @@ func (e configEnv) badFiles(files []configFile) (map[string]string, error) {
 		if !errors.As(err, &le) {
 			return nil, err
 		}
+		// Ask a second time: a failure that does not repeat (a fetch while
+		// the network comes up) is not about the file.
+		if again := e.agentLoads(paths[i]); again == nil {
+			return nil, noVerdict("kairos-agent gave two answers for %s", f.Path)
+		} else if !errors.As(again, &le) {
+			return nil, again
+		}
 		bad[f.Path] = le.Error()
 	}
 	if len(bad) == 0 {
@@ -721,6 +754,11 @@ func (e configEnv) badFile(path string) (string, error) {
 	}
 	if err := e.control(); err != nil {
 		return "", err
+	}
+	if again := e.agentLoads(path); again == nil {
+		return "", noVerdict("kairos-agent gave two answers for %s", path)
+	} else if !errors.As(again, &le) {
+		return "", again
 	}
 	return le.Error(), nil
 }
@@ -834,7 +872,7 @@ func (e configEnv) guard() []guardEvent {
 	if last != nil {
 		good = byPath(writable(last.Files))
 	}
-	stamp := now.Format("20060102-150405")
+	stamp := e.newSet()
 	paths := make([]string, 0, len(bad))
 	for p := range bad {
 		paths = append(paths, p)

@@ -80,6 +80,7 @@ func cmdConfig(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		defer unlock()
 		events := e.guard()
+		e.pruneRejected()
 		e.record(events)
 		printEvents(stderr, events)
 		return exitOK
@@ -400,7 +401,7 @@ func configApply(e configEnv, args []string, stdout, stderr io.Writer) int {
 	if info, err := os.Stat(e.real(dst)); err == nil {
 		mode = info.Mode().Perm()
 		uid, gid = owner(info)
-		if saved, err = e.setAside(dst, e.Now().UTC().Format("20060102-150405")); err != nil {
+		if saved, err = e.setAside(dst, e.newSet()); err != nil {
 			return configFail(stderr, err)
 		}
 	}
@@ -556,11 +557,6 @@ func configRollback(e configEnv, args []string, stdin io.Reader, stdout, stderr 
 		fmt.Fprint(stderr, "isotope config rollback: give at most one generation\n")
 		return exitUsage
 	}
-	unlock, err := e.lock()
-	if err != nil {
-		return configFail(stderr, err)
-	}
-	defer unlock()
 	files, err := e.scan()
 	if err != nil {
 		return configFail(stderr, err)
@@ -593,6 +589,12 @@ func configRollback(e configEnv, args []string, stdin io.Reader, stdout, stderr 
 		fmt.Fprintln(stdout, "Nothing was changed.")
 		return exitError
 	}
+	// The lock only now: a question left open must not hold the boot's guard.
+	unlock, err := e.lock()
+	if err != nil {
+		return configFail(stderr, err)
+	}
+	defer unlock()
 	events, err := e.restoreSet(g, "rollback")
 	e.record(events)
 	if err != nil {

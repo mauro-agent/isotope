@@ -87,8 +87,8 @@ boot: the same binary gives both answers.
 Strict mode also fails for what is not in `DIR`: a `kairos.config_url` on the
 kernel command line that cannot be fetched, an agent that crashes. So a "no"
 is a verdict on a file only when all of these hold: the exit code is 1, the
-agent says no to that file alone, and it says yes to an empty directory
-before and after. Anything else is **no verdict**: the guard changes nothing,
+agent says no to that file alone two times, and it says yes to an empty
+directory before and after. Anything else is **no verdict**: the guard changes nothing,
 the commit records nothing, `check` and `apply` exit 3.
 
 ### Generations
@@ -109,14 +109,16 @@ They live in `/oem/.isotope-config/`, mode 0700, the last 5:
 ```
 generations/000007.json     the record
 blobs/<sha256>              the copies
-rejected/<time>/<path>.rejected   every file the tool replaced or removed,
+rejected/<n>-<time>/<path>.rejected
+                                  every file the tool replaced or removed,
                                   the last 10 times
 events.json, events.log           what the last boot did; everything it did
 ```
 
 Every write goes through a temporary file in the same directory and a rename.
 The guard, the commit, `apply` and `rollback` take a lock on the store, so two
-of them never write at once.
+of them never write at once. None of them waits for the lock longer than its
+own time limit, and `rollback` takes it only after its question is answered.
 
 `/oem` and not `/usr/local`, because the guard runs in the initramfs stage and
 on every boot entry, and `/oem` is what all of them mount. No stored file ends
@@ -142,8 +144,10 @@ of the writable directories. For each one that does not load:
 - the last generation has another copy of that path: the bad file goes to
   `rejected/`, the copy is put back, and the boot goes on with it;
 - it has none, or the same one, or the copy does not load either (the agent
-  changed with an upgrade): the file is left as it is. Kairos skips it, as it
-  does today.
+  changed with an upgrade): the file is left as it is, and Kairos does what
+  it does today. On this image that is the lockout: the whole of `/oem` is
+  skipped. A file that is bad before the first generation exists is not
+  covered.
 
 The guard always exits 0 and stops itself after 90 seconds. With no verdict
 it changes nothing. It also runs in the recovery system, which reads the same

@@ -19,6 +19,10 @@ const fakeConfigAgent = `#!/bin/sh
 # config_url on the kernel command line that cannot be fetched.
 [ "$FAKE_AGENT" = always-fails ] && [ "$1" = run-stage ] && { printf '\t* could not fetch\n'; exit 1; }
 [ "$FAKE_AGENT" = crashes ] && [ "$1" = run-stage ] && exit 2
+if [ "$FAKE_AGENT" = flaky ] && [ "$1" = run-stage ]; then
+	n=$(cat "$FAKE_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$FAKE_COUNT"
+	case $n in 1|3) printf '\t* could not fetch\n'; exit 1 ;; *) exit 0 ;; esac
+fi
 case "$1" in
 config)
 	printf '#cloud-config\n\n# Sources:\n# - /oem/90_custom.yaml\n# - https://user:secret@example.com/c.yaml?token=abc\n#\nhostname: test\n'
@@ -553,14 +557,71 @@ func TestConfigRollbackTakesItsFlagsInAnyOrder(t *testing.T) {
 
 func TestConfigKeepsTheLastReplacedSets(t *testing.T) {
 	f := newConfigFixture(t)
+	// The clock goes backwards, as on a machine with a dead battery: the
+	// newest set must still be the one that stays.
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	f.e.Now = func() time.Time { clock = clock.Add(-time.Hour); return clock }
+	var last string
 	for i := 0; i < configKeepRejected+4; i++ {
-		if _, err := f.e.setAside("/oem/90_custom.yaml", time.Unix(int64(i), 0).UTC().Format("20060102-150405")); err != nil {
+		set := f.e.newSet()
+		if set == last {
+			t.Fatalf("two commands share the set %s", set)
+		}
+		last = set
+		if _, err := f.e.setAside("/oem/90_custom.yaml", set); err != nil {
 			t.Fatal(err)
 		}
 	}
 	f.e.pruneRejected()
 	sets, _ := os.ReadDir(f.e.real("/oem/.isotope-config/rejected"))
-	if len(sets) != configKeepRejected || sets[0].Name() != "19700101-000004" {
-		t.Fatalf("kept %d sets, oldest %s", len(sets), sets[0].Name())
+	if len(sets) != configKeepRejected || !strings.HasPrefix(sets[0].Name(), "000005-") || sets[len(sets)-1].Name() != last {
+		t.Fatalf("kept %d sets, from %s to %s, want the last %d", len(sets), sets[0].Name(), sets[len(sets)-1].Name(), configKeepRejected)
+	}
+}
+
+// An answer that does not repeat is not about the file.
+func TestConfigAFailureThatDoesNotRepeatIsNotAVerdict(t *testing.T) {
+	f := newConfigFixture(t)
+	f.commit()
+	edited := goodUser + "# a good edit\n"
+	f.write("/oem/90_custom.yaml", edited, 0o600)
+	// Fails the first call (all files) and the third (the file alone); the
+	// control between them and the second ask pass.
+	t.Setenv("FAKE_AGENT", "flaky")
+	t.Setenv("FAKE_COUNT", filepath.Join(t.TempDir(), "count"))
+	events := f.e.guard()
+	if len(events) != 1 || events[0].Action != "skipped" || f.read("/oem/90_custom.yaml") != edited {
+		t.Fatalf("guard = %+v, want skipped and the file untouched", events)
+	}
+}
+
+func TestConfigGuardLeavesAFileWhoseLastGoodCopyDoesNotLoad(t *testing.T) {
+	f := newConfigFixture(t)
+	_, g := f.commit()
+	// The agent of a new image no longer loads what the old one did.
+	blob := f.e.blob(byPath(g.Files)["/oem/90_custom.yaml"].SHA256)
+	os.WriteFile(blob, []byte("BROKEN\n"), 0o600)
+	f.write("/oem/90_custom.yaml", "BROKEN too\n", 0o600)
+	events := f.e.guard()
+	if len(events) != 1 || events[0].Action != "left" || f.read("/oem/90_custom.yaml") != "BROKEN too\n" {
+		t.Fatalf("guard = %+v, want the file left", events)
+	}
+}
+
+func TestConfigLockDoesNotWaitPastItsTime(t *testing.T) {
+	f := newConfigFixture(t)
+	unlock, err := f.e.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	second := f.e
+	second.Until = time.Now().Add(200 * time.Millisecond)
+	start := time.Now()
+	if _, err := second.lock(); err == nil {
+		t.Fatal("two commands hold the lock")
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("the lock waited %s past its time", time.Since(start))
 	}
 }
