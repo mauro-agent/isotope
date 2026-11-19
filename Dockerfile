@@ -104,8 +104,9 @@ WORKDIR /build
 RUN curl --retry-all-errors -fL --retry 5 https://github.com/kaniini/libucontext/archive/refs/tags/libucontext-${LIBUCONTEXT_VERSION}.tar.gz -o libucontext.tar.gz && \
     tar -xf libucontext.tar.gz && mv libucontext-* src
 WORKDIR /build/src
-RUN make -j"$(nproc)" ARCH=x86_64
-RUN make ARCH=x86_64 DESTDIR=/libucontext install
+# ARCH is the machine the build runs for: x86_64 or aarch64.
+RUN make -j"$(nproc)" ARCH="$(uname -m)"
+RUN make ARCH="$(uname -m)" DESTDIR=/libucontext install
 
 
 # ===========================================================================
@@ -158,10 +159,13 @@ WORKDIR /build
 RUN curl --retry 5 --retry-delay 3 --retry-all-errors -fL https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz -o llvm.tar.xz && \
     tar -xf llvm.tar.xz && rm llvm.tar.xz && mv llvm-project-* llvm-project
 WORKDIR /build/llvm-project
-RUN cmake -G Ninja -S llvm -B build \
+# The native code generator is X86 on x86_64 and AArch64 on aarch64. llvmpipe
+# needs the one of the machine it runs on.
+RUN case "$(uname -m)" in aarch64) native=AArch64 ;; *) native=X86 ;; esac; \
+    cmake -G Ninja -S llvm -B build \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-O2 -pipe" -DCMAKE_CXX_FLAGS="-O2 -pipe" \
       -DCMAKE_INSTALL_PREFIX=/usr -DLLVM_LIBDIR_SUFFIX="" \
-      -DLLVM_TARGETS_TO_BUILD="X86;AMDGPU;SPIRV" \
+      -DLLVM_TARGETS_TO_BUILD="${native};AMDGPU;SPIRV" \
       -DLLVM_ENABLE_PROJECTS="clang;libclc" \
       -DLIBCLC_TARGETS_TO_BUILD="amdgcn--;amdgcn--amdhsa" \
       -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON \
@@ -281,6 +285,13 @@ RUN if [ "$GPU" = "full" ]; then \
       DRV="iris,radeonsi,nouveau,llvmpipe,virgl,softpipe,svga"; \
     else \
       DRV="llvmpipe,virgl,softpipe,svga"; \
+    fi; \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+      if [ "$GPU" = "full" ]; then \
+        DRV="etnaviv,llvmpipe,virgl,softpipe"; \
+      else \
+        DRV="llvmpipe,virgl,softpipe"; \
+      fi; \
     fi; \
     meson setup buildDir ${COMMON_MESON_FLAGS} -Dplatforms=wayland \
     -Dgallium-drivers="$DRV" \
@@ -1582,7 +1593,7 @@ FROM toolchain AS docker
 ARG DOCKER_VERSION=29.5.3
 RUN mkdir -p /docker/usr/bin
 WORKDIR /build
-RUN curl -fL --retry 5 --retry-delay 3 --retry-all-errors https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz -o d.tgz \
+RUN curl -fL --retry 5 --retry-delay 3 --retry-all-errors https://download.docker.com/linux/static/stable/$(uname -m)/docker-${DOCKER_VERSION}.tgz -o d.tgz \
     && tar -xf d.tgz && rm d.tgz \
     && cp -a docker/dockerd docker/docker docker/containerd docker/containerd-shim-runc-v2 docker/runc docker/docker-init docker/docker-proxy docker/ctr /docker/usr/bin/ \
     && rm -rf docker
@@ -1747,7 +1758,7 @@ RUN curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
     tar -xf source.tar.gz && rm source.tar.gz && mv sqlite-autoconf-* src
 WORKDIR /build/src
 RUN CFLAGS="-O2 -pipe -flto" ./configure --prefix=/usr \
-      --host=x86_64-hadron-linux-musl --build=x86_64-hadron-linux-musl \
+      --host="$(uname -m)-hadron-linux-musl" --build="$(uname -m)-hadron-linux-musl" \
       --enable-shared --disable-static --disable-readline --disable-static-shell
 RUN make -j"$(nproc)" && make DESTDIR=/sqlite-gnupg install
 
@@ -2623,6 +2634,13 @@ RUN if [ "$GPU" = "full" ]; then \
     else \
       DRV="llvmpipe,virgl,softpipe,svga"; \
     fi; \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+      if [ "$GPU" = "full" ]; then \
+        DRV="etnaviv,llvmpipe,virgl,softpipe"; \
+      else \
+        DRV="llvmpipe,virgl,softpipe"; \
+      fi; \
+    fi; \
     meson setup buildDir ${COMMON_MESON_FLAGS} -Dplatforms=x11,wayland \
       -Dgallium-drivers="$DRV" -Dglx=dri -Dopengl=true -Dgles1=enabled -Dgles2=enabled \
       -Degl=enabled -Dvulkan-drivers= -Dllvm=enabled -Dcpp_rtti=false -Dbuild-tests=false
@@ -3045,7 +3063,7 @@ ARG ZIG_VERSION=0.16.0
 ARG LY_VERSION=1.4.1
 RUN mkdir -p /ly
 WORKDIR /build
-RUN curl --retry 5 --retry-delay 3 --retry-all-errors -L https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz -o zig.tar.xz && tar -xf zig.tar.xz && rm zig.tar.xz && mv zig-x86_64-linux-* /opt/zig
+RUN curl --retry 5 --retry-delay 3 --retry-all-errors -L https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz -o zig.tar.xz && tar -xf zig.tar.xz && rm zig.tar.xz && mv zig-*-linux-* /opt/zig
 ENV PATH=/opt/zig:$PATH
 RUN curl --retry 5 --retry-delay 3 --retry-all-errors -L https://github.com/fairyglade/ly/archive/refs/tags/v${LY_VERSION}.tar.gz -o ly.tar.gz && tar -xzf ly.tar.gz && rm ly.tar.gz && mv ly-* ly-src
 WORKDIR /build/ly-src
