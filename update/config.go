@@ -63,6 +63,9 @@ type configEnv struct {
 	Passwd string
 	Tmp    string
 	Now    func() time.Time
+	// Until is when the boot stops waiting for this command. Zero: no limit
+	// but the one of each call.
+	Until time.Time
 }
 
 func newConfigEnv() configEnv {
@@ -135,19 +138,20 @@ func (e configEnv) scan() ([]configFile, error) {
 				}
 				return nil
 			}
-			if !de.Type().IsRegular() {
+			if de.IsDir() {
 				return nil
 			}
 			if ext := filepath.Ext(p); ext != ".yaml" && ext != ".yml" {
 				return nil
 			}
+			// Like yip: a link to a regular file is read, anything else is not.
+			info, err := os.Stat(p)
+			if err != nil || !info.Mode().IsRegular() {
+				return nil
+			}
 			data, err := os.ReadFile(p)
 			if err != nil {
 				return fmt.Errorf("reading %s: %w", p, err)
-			}
-			info, err := de.Info()
-			if err != nil {
-				return err
 			}
 			rel, _ := filepath.Rel(base, p)
 			sum := sha256.Sum256(data)
@@ -237,11 +241,12 @@ func (e configEnv) latest() *generation {
 // writeAtomic writes a file through a temporary name that Kairos does not
 // read (no .yaml), so a power cut leaves the old file or the new one.
 func writeAtomic(path string, data []byte, mode fs.FileMode) error {
-	tmp := path + ".isotope-tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".isotope-*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if _, err = f.Write(data); err == nil {
 		err = f.Sync()
 	}
@@ -256,8 +261,31 @@ func writeAtomic(path string, data []byte, mode fs.FileMode) error {
 	}
 	if err != nil {
 		os.Remove(tmp)
+		return err
 	}
-	return err
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
+}
+
+// lock keeps two runs from changing the config at the same time: the commit
+// of a boot and an apply or a rollback by hand. The caller runs the function
+// it returns when it is done.
+func (e configEnv) lock() (func(), error) {
+	if err := os.MkdirAll(e.real(e.State), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(e.real(e.State))
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { f.Close() }, nil
 }
 
 // save records the files as a new generation and keeps a copy of each file
@@ -326,6 +354,25 @@ func (e configEnv) prune() {
 			os.Remove(filepath.Join(e.blobDir(), b.Name()))
 		}
 	}
+	e.pruneRejected()
+}
+
+// configKeepRejected is how many sets of replaced files stay.
+const configKeepRejected = 10
+
+// pruneRejected drops the oldest sets of replaced files, and starts the log
+// again when it is large. The OEM partition is small.
+func (e configEnv) pruneRejected() {
+	dir := filepath.Join(e.real(e.State), "rejected")
+	sets, _ := os.ReadDir(dir) // by name, and the names are times
+	for len(sets) > configKeepRejected {
+		os.RemoveAll(filepath.Join(dir, sets[0].Name()))
+		sets = sets[1:]
+	}
+	log := filepath.Join(e.real(e.State), "events.log")
+	if info, err := os.Stat(log); err == nil && info.Size() > 256<<10 {
+		os.Rename(log, log+".1")
+	}
 }
 
 // setAside keeps a copy of a file that is about to be replaced or removed,
@@ -335,8 +382,7 @@ func (e configEnv) setAside(path, stamp string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	name := strings.ReplaceAll(strings.TrimPrefix(path, "/"), "/", "__") + ".rejected"
-	dst := filepath.Join(e.State, "rejected", stamp, name)
+	dst := filepath.Join(e.State, "rejected", stamp, path+".rejected")
 	if err := os.MkdirAll(filepath.Dir(e.real(dst)), 0o700); err != nil {
 		return "", err
 	}
@@ -500,44 +546,78 @@ func (e configEnv) record(events []guardEvent) {
 
 // errNoVerdict means the check could not run, which says nothing about the
 // files. The guard then leaves everything as it is.
-var errNoVerdict = errors.New("could not ask kairos-agent")
+var errNoVerdict = errors.New("no answer from kairos-agent")
+
+func noVerdict(format string, args ...any) error {
+	return fmt.Errorf("%w: "+format, append([]any{errNoVerdict}, args...)...)
+}
+
+// agentCall is the longest one call to kairos-agent may take.
+const agentCall = 45 * time.Second
+
+// agentContext is the time one call has: agentCall, or what is left of the
+// time the boot gives this command.
+func (e configEnv) agentContext(limit time.Duration) (context.Context, context.CancelFunc, error) {
+	deadline := time.Now().Add(limit)
+	if !e.Until.IsZero() {
+		if !time.Now().Before(e.Until) {
+			return nil, nil, noVerdict("out of time")
+		}
+		if e.Until.Before(deadline) {
+			deadline = e.Until
+		}
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	return ctx, cancel, nil
+}
 
 // agentLoads asks kairos-agent to load the files, with the loader it uses at
 // boot and in strict mode, for a stage that has no step. nil means every file
-// loads. A *loadError means at least one does not.
-func (e configEnv) agentLoads(paths []string) error {
+// loads. A *loadError means kairos-agent ran and said no: exit code 1, which
+// is what strict mode gives for a stage error. Anything else (it did not
+// start, it ran out of time, it crashed) is no verdict.
+//
+// With no path it loads an empty directory: the control. Strict mode also
+// fails for what is not in the directory, such as a kairos.config_url on the
+// kernel command line that cannot be fetched, so a "no" counts only when the
+// control says "yes"; badFiles sees to that.
+func (e configEnv) agentLoads(paths ...string) error {
 	if err := os.MkdirAll(e.real(e.Tmp), 0o700); err != nil {
-		return fmt.Errorf("%w: %v", errNoVerdict, err)
+		return noVerdict("%w", err)
 	}
 	dir, err := os.MkdirTemp(e.real(e.Tmp), "config-check-")
 	if err != nil {
-		return fmt.Errorf("%w: %v", errNoVerdict, err)
+		return noVerdict("%w", err)
 	}
 	defer os.RemoveAll(dir)
 	for i, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return fmt.Errorf("%w: %v", errNoVerdict, err)
+			return noVerdict("%w", err)
 		}
 		name := fmt.Sprintf("%04d_%s", i, filepath.Base(p))
 		if ext := filepath.Ext(name); ext != ".yaml" && ext != ".yml" {
 			name += ".yaml"
 		}
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
-			return fmt.Errorf("%w: %v", errNoVerdict, err)
+			return noVerdict("%w", err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel, err := e.agentContext(agentCall)
+	if err != nil {
+		return err
+	}
 	defer cancel()
 	cmd := exec.CommandContext(ctx, kairosAgent(), "run-stage", "--strict",
 		"--override-cloud-init-paths", dir, configCheckStage)
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return nil
 	}
 	var exit *exec.ExitError
-	if ctx.Err() != nil || !errors.As(err, &exit) {
-		return fmt.Errorf("%w: %v", errNoVerdict, err)
+	if ctx.Err() != nil || !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		return noVerdict("%v", err)
 	}
 	return &loadError{Detail: loadDetail(string(out))}
 }
@@ -573,9 +653,21 @@ func loadDetail(out string) string {
 	return strings.Join(reasons, "; ")
 }
 
+// control checks that kairos-agent says yes to an empty directory. When it
+// does not, its "no" to a file means nothing.
+func (e configEnv) control() error {
+	err := e.agentLoads()
+	var le *loadError
+	if errors.As(err, &le) {
+		return noVerdict("it fails with no file to load: %s", le)
+	}
+	return err
+}
+
 // badFiles returns the files kairos-agent will not load at boot, with the
 // reason. It asks once for all of them, and file by file only when that
-// fails, so a good config costs one call.
+// fails, so a good config costs one call. A file is bad only when the agent
+// says no to it alone and yes to an empty directory, before and after.
 func (e configEnv) badFiles(files []configFile) (map[string]string, error) {
 	if len(files) == 0 {
 		return nil, nil
@@ -584,7 +676,7 @@ func (e configEnv) badFiles(files []configFile) (map[string]string, error) {
 	for i, f := range files {
 		paths[i] = e.real(f.Path)
 	}
-	err := e.agentLoads(paths)
+	err := e.agentLoads(paths...)
 	if err == nil {
 		return nil, nil
 	}
@@ -592,9 +684,12 @@ func (e configEnv) badFiles(files []configFile) (map[string]string, error) {
 	if !errors.As(err, &le) {
 		return nil, err
 	}
+	if err := e.control(); err != nil {
+		return nil, err
+	}
 	bad := map[string]string{}
 	for i, f := range files {
-		err := e.agentLoads(paths[i : i+1])
+		err := e.agentLoads(paths[i])
 		if err == nil {
 			continue
 		}
@@ -605,17 +700,42 @@ func (e configEnv) badFiles(files []configFile) (map[string]string, error) {
 	}
 	if len(bad) == 0 {
 		// All together fail and each alone loads: not a verdict on any file.
-		return nil, fmt.Errorf("%w: the files load one by one but not together", errNoVerdict)
+		return nil, noVerdict("the files load one by one but not together")
+	}
+	if err := e.control(); err != nil {
+		return nil, err
 	}
 	return bad, nil
+}
+
+// badFile is badFiles for one file anywhere on disk: the reason kairos-agent
+// will not load it, or "" when it loads.
+func (e configEnv) badFile(path string) (string, error) {
+	err := e.agentLoads(path)
+	if err == nil {
+		return "", nil
+	}
+	var le *loadError
+	if !errors.As(err, &le) {
+		return "", err
+	}
+	if err := e.control(); err != nil {
+		return "", err
+	}
+	return le.Error(), nil
 }
 
 // merged asks kairos-agent for the merged config, which follows config_url.
 // It returns the hash of the config and what was merged.
 func (e configEnv) merged() (string, []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel, err := e.agentContext(2 * time.Minute)
+	if err != nil {
+		return "", nil
+	}
 	defer cancel()
-	out, err := exec.CommandContext(ctx, kairosAgent(), "config").Output()
+	cmd := exec.CommandContext(ctx, kairosAgent(), "config")
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		return "", nil
 	}
@@ -732,6 +852,10 @@ func (e configEnv) guard() []guardEvent {
 		case g.SHA256 == cur[p].SHA256:
 			ev.Action = "left"
 			ev.Reason += " (the last good copy is the same file)"
+		case e.agentLoads(e.blob(g.SHA256)) != nil:
+			// The agent of this image may not load what an older one did.
+			ev.Action = "left"
+			ev.Reason += " (the last good copy does not load either)"
 		default:
 			saved, err := e.setAside(p, stamp)
 			if err == nil {
@@ -780,7 +904,12 @@ func (e configEnv) commit() ([]guardEvent, *generation, error) {
 				args = append(args, "--override-cloud-init-paths", e.real(d.Path))
 			}
 		}
-		exec.Command(kairosAgent(), append(args, "boot")...).Run()
+		if ctx, cancel, err := e.agentContext(2 * time.Minute); err == nil {
+			cmd := exec.CommandContext(ctx, kairosAgent(), append(args, "boot")...)
+			cmd.WaitDelay = 5 * time.Second
+			cmd.Run()
+			cancel()
+		}
 		reason := "no user could log in with the changed config"
 		if e.canLogin() {
 			reason += "; the user is back, restart to apply the rest"
@@ -795,7 +924,11 @@ func (e configEnv) commit() ([]guardEvent, *generation, error) {
 		return nil, nil, nil
 	}
 	bad, err := e.badFiles(writable(files))
-	if err != nil && !errors.Is(err, errNoVerdict) {
+	if errors.Is(err, errNoVerdict) {
+		// Not known to load: not a generation to go back to.
+		return []guardEvent{{Time: now, Stage: "commit", Action: "not committed", Reason: err.Error()}}, nil, nil
+	}
+	if err != nil {
 		return nil, nil, err
 	}
 	if len(bad) > 0 {

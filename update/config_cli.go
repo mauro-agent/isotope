@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const configUsage = `Usage: isotope config [command]
@@ -25,7 +26,8 @@ Commands:
       --json             the same as JSON
       --remote           also the merged config, which follows config_url
   check [FILE...]   load each file the way the boot does and say which ones
-                    Kairos would skip; exits 1 when one does not load.
+                    Kairos would skip; exits 1 when one does not load, 3
+                    when kairos-agent gave no answer.
                     Without FILE: every file of this machine
   apply FILE        check FILE, then install it in /oem under its own name;
                     a file that does not load is refused
@@ -69,11 +71,26 @@ func cmdConfig(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return configRollback(e, args, stdin, stdout, stderr)
 	case "guard":
 		// Never fail the boot: the guard reports, it does not stop anything.
+		// Never hold it up either: the initramfs waits for this.
+		e.Until = time.Now().Add(90 * time.Second)
+		unlock, err := e.lock()
+		if err != nil {
+			fmt.Fprintf(stderr, "isotope config guard: %v\n", err)
+			return exitOK
+		}
+		defer unlock()
 		events := e.guard()
 		e.record(events)
 		printEvents(stderr, events)
 		return exitOK
 	case "commit":
+		// The unit has 5 minutes (TimeoutStartSec).
+		e.Until = time.Now().Add(4 * time.Minute)
+		unlock, err := e.lock()
+		if err != nil {
+			return configFail(stderr, err)
+		}
+		defer unlock()
 		events, g, err := e.commit()
 		e.record(events)
 		printEvents(stderr, events)
@@ -117,13 +134,42 @@ func printEvents(w io.Writer, events []guardEvent) {
 	}
 }
 
+// exitNoVerdict is for a check kairos-agent did not answer: not "the file is
+// bad", and not "the file is good".
+const exitNoVerdict = 3
+
 func configFail(stderr io.Writer, err error) int {
 	if errors.Is(err, os.ErrPermission) {
 		fmt.Fprintf(stderr, "isotope config: %v\nThe cloud-config files belong to root: run it with sudo.\n", err)
 	} else {
 		fmt.Fprintf(stderr, "isotope config: %v\n", err)
 	}
+	if errors.Is(err, errNoVerdict) {
+		return exitNoVerdict
+	}
 	return exitError
+}
+
+// flagsFirst moves the flags before the other arguments, so that
+// "rollback 3 --yes" is "rollback --yes 3". None of these flags takes a value
+// but --as.
+func flagsFirst(args []string) []string {
+	var flags, rest []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--as" || args[i] == "-as":
+			flags = append(flags, args[i])
+			if i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		case strings.HasPrefix(args[i], "-") && args[i] != "-":
+			flags = append(flags, args[i])
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return append(flags, rest...)
 }
 
 // change is one file that differs between a generation and the disk.
@@ -275,11 +321,15 @@ func configCheck(e configEnv, args []string, stdout, stderr io.Writer) int {
 			return configFail(stderr, err)
 		}
 		files = append(files, configFile{Path: a})
-		var le *loadError
-		if err := e.agentLoads([]string{abs}); errors.As(err, &le) {
-			bad[a] = le.Error()
-		} else if err != nil {
+		if _, err := os.Stat(abs); err != nil {
 			return configFail(stderr, err)
+		}
+		reason, err := e.badFile(abs)
+		if err != nil {
+			return configFail(stderr, err)
+		}
+		if reason != "" {
+			bad[a] = reason
 		}
 	}
 	for _, f := range files {
@@ -299,7 +349,7 @@ func configCheck(e configEnv, args []string, stdout, stderr io.Writer) int {
 func configApply(e configEnv, args []string, stdout, stderr io.Writer) int {
 	fs := newFlags("config apply", stderr)
 	as := fs.String("as", "", "")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 1 {
+	if err := fs.Parse(flagsFirst(args)); err != nil || fs.NArg() != 1 {
 		fmt.Fprint(stderr, "isotope config apply: give one FILE\n")
 		return exitUsage
 	}
@@ -316,19 +366,43 @@ func configApply(e configEnv, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return configFail(stderr, err)
 	}
-	abs, _ := filepath.Abs(src)
-	if err := e.agentLoads([]string{abs}); err != nil {
-		var le *loadError
-		if errors.As(err, &le) {
-			fmt.Fprintf(stderr, "isotope config apply: %s does not load, nothing was changed:\n  %s\n", src, le)
-			return exitError
-		}
+	unlock, err := e.lock()
+	if err != nil {
 		return configFail(stderr, err)
 	}
+	defer unlock()
+	// Check the bytes that get installed, not the file a second time.
+	if err := os.MkdirAll(e.real(e.Tmp), 0o700); err != nil {
+		return configFail(stderr, err)
+	}
+	cand, err := os.CreateTemp(e.real(e.Tmp), "config-apply-")
+	if err != nil {
+		return configFail(stderr, err)
+	}
+	defer os.Remove(cand.Name())
+	_, err = cand.Write(data)
+	if cerr := cand.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return configFail(stderr, err)
+	}
+	reason, err := e.badFile(cand.Name())
+	if err != nil {
+		return configFail(stderr, err)
+	}
+	if reason != "" {
+		fmt.Fprintf(stderr, "isotope config apply: %s does not load, nothing was changed:\n  %s\n", src, reason)
+		return exitError
+	}
 	dst := filepath.Join("/oem", name)
-	mode := os.FileMode(0o600)
+	mode, uid, gid, saved := os.FileMode(0o600), -1, -1, ""
 	if info, err := os.Stat(e.real(dst)); err == nil {
 		mode = info.Mode().Perm()
+		uid, gid = owner(info)
+		if saved, err = e.setAside(dst, e.Now().UTC().Format("20060102-150405")); err != nil {
+			return configFail(stderr, err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(e.real(dst)), 0o755); err != nil {
 		return configFail(stderr, err)
@@ -336,7 +410,13 @@ func configApply(e configEnv, args []string, stdout, stderr io.Writer) int {
 	if err := writeAtomic(e.real(dst), data, mode); err != nil {
 		return configFail(stderr, err)
 	}
+	if uid >= 0 {
+		os.Chown(e.real(dst), uid, gid)
+	}
 	fmt.Fprintf(stdout, "%s installed. It applies at the next boot.\n", dst)
+	if saved != "" {
+		fmt.Fprintf(stdout, "The file it replaced is %s.\n", saved)
+	}
 	if l := e.latest(); l != nil {
 		fmt.Fprintf(stdout, "\"isotope config rollback\" goes back to generation %d.\n", l.ID)
 	}
@@ -472,9 +552,15 @@ func configHistory(e configEnv, stdout io.Writer) int {
 func configRollback(e configEnv, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := newFlags("config rollback", stderr)
 	yes := fs.Bool("yes", false, "")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args)); err != nil || fs.NArg() > 1 {
+		fmt.Fprint(stderr, "isotope config rollback: give at most one generation\n")
 		return exitUsage
 	}
+	unlock, err := e.lock()
+	if err != nil {
+		return configFail(stderr, err)
+	}
+	defer unlock()
 	files, err := e.scan()
 	if err != nil {
 		return configFail(stderr, err)
@@ -504,7 +590,8 @@ func configRollback(e configEnv, args []string, stdin io.Reader, stdout, stderr 
 		fmt.Fprintf(stdout, "  %-8s %s\n", verb, c.Path)
 	}
 	if !*yes && !confirm(bufio.NewReader(stdin), stdout, "Continue?", false) {
-		return exitOK
+		fmt.Fprintln(stdout, "Nothing was changed.")
+		return exitError
 	}
 	events, err := e.restoreSet(g, "rollback")
 	e.record(events)

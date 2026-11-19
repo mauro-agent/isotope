@@ -27,10 +27,13 @@ with the agent this image ships (v4.5.3-dev.2).
   them in name order, **one file at a time**. The collector merges the files
   into one config for the agent's own settings, and only the collector follows
   `config_url`.
-- **A file that does not load is skipped as a whole.** The other files still
-  run, `kairos-agent run-stage` exits 0, and the unit is green. Everything in
-  the skipped file is gone for that boot, the users included. Tested: a wrong
-  indent, or `shell: [/bin/bash]`, gives no user and exit 0.
+- **A file that does not load is skipped as a whole, and on this image so is
+  every other file of its directory.** `kairos-agent run-stage` exits 0, and
+  the unit is green. Everything in the skipped files is gone for that boot,
+  the users included. Tested: a wrong indent, or `shell: [/bin/bash]`, gives
+  no user and exit 0, and a good file next to the bad one in `/oem` does not
+  create its user either. Kairos master (yip v1.27.0) skips only the bad
+  file; the agent in v0.0.22 is older than that.
 - **`kairos-agent validate` does not tell.** It checks the Kairos schema, not
   what yip loads. Tested: the `shell: [/bin/bash]` file passes `validate`,
   `kairos-agent config` shows its user, and the boot creates no user.
@@ -81,6 +84,13 @@ one call and a bad one is named.
 Using the agent, not a YAML library, means the check cannot disagree with the
 boot: the same binary gives both answers.
 
+Strict mode also fails for what is not in `DIR`: a `kairos.config_url` on the
+kernel command line that cannot be fetched, an agent that crashes. So a "no"
+is a verdict on a file only when all of these hold: the exit code is 1, the
+agent says no to that file alone, and it says yes to an empty directory
+before and after. Anything else is **no verdict**: the guard changes nothing,
+the commit records nothing, `check` and `apply` exit 3.
+
 ### Generations
 
 A generation is the config of a boot that ended with a user who can log in:
@@ -99,9 +109,14 @@ They live in `/oem/.isotope-config/`, mode 0700, the last 5:
 ```
 generations/000007.json     the record
 blobs/<sha256>              the copies
-rejected/<time>/….rejected  every file the tool replaced or removed
-events.json, events.log     what the last boot did; everything it ever did
+rejected/<time>/<path>.rejected   every file the tool replaced or removed,
+                                  the last 10 times
+events.json, events.log           what the last boot did; everything it did
 ```
+
+Every write goes through a temporary file in the same directory and a rename.
+The guard, the commit, `apply` and `rollback` take a lock on the store, so two
+of them never write at once.
 
 `/oem` and not `/usr/local`, because the guard runs in the initramfs stage and
 on every boot entry, and `/oem` is what all of them mount. No stored file ends
@@ -114,7 +129,8 @@ readable by root only.
 **1. Before the change.** `isotope config check [FILE...]` runs the check and
 names each file Kairos would skip. `isotope config apply FILE` checks the
 file, refuses one that does not load, and installs the rest into `/oem`
-through a rename, so a power cut leaves the old file or the new one.
+through a rename, so a power cut leaves the old file or the new one. The file
+it replaces goes to `rejected/`.
 
 **2. The guard, before Kairos reads `/oem`.**
 `/system/oem/07_isotope_config_guard.yaml` runs `isotope config guard` in
@@ -125,11 +141,13 @@ of the writable directories. For each one that does not load:
 
 - the last generation has another copy of that path: the bad file goes to
   `rejected/`, the copy is put back, and the boot goes on with it;
-- it has none, or the same one: the file is left as it is. Kairos skips it,
-  as it does today.
+- it has none, or the same one, or the copy does not load either (the agent
+  changed with an upgrade): the file is left as it is. Kairos skips it, as it
+  does today.
 
-The guard always exits 0. If the agent is missing, times out, or gives an
-answer that names no file, it changes nothing.
+The guard always exits 0 and stops itself after 90 seconds. With no verdict
+it changes nothing. It also runs in the recovery system, which reads the same
+`/oem` and creates the same users.
 
 **3. The commit, after the boot stage.** `isotope-config-commit.service` runs
 `isotope config commit` after `cos-setup-boot`, which is when `/etc/passwd`
@@ -145,8 +163,16 @@ has been written again from the cloud-config.
 - None exists and the files did not change: the cause is not a config file,
   and nothing is touched.
 
-A set with a file that does not load is never recorded. A machine that never
-had a login user (an appliance) is never rolled back for not having one.
+A set with a file that does not load, or with no verdict, is never recorded.
+A machine that never had a login user (an appliance) is never rolled back for
+not having one. The unit has 5 minutes and the command stops itself after 4,
+so it cannot hold the boot. It does not run in the recovery system.
+
+The rollback runs the whole `boot` stage of `/oem` and
+`/usr/local/cloud-config` a second time in that boot. A command there that
+must run once per boot runs twice. That is the price of getting the user back
+without a restart, and it is paid only on a boot that would otherwise have
+ended with no login.
 
 The test for a rollback is "nobody can log in", not "something changed":
 removing or renaming a user on purpose is not a failure.
@@ -208,6 +234,10 @@ cannot run stages, so it cannot create a user.
   is not tested yet.
 - The check answers "does it load". A file that loads and does something
   wrong, other than removing every user, is not caught.
+- A link in `/oem` to a file is part of the config, as it is for yip. When
+  the guard repairs it, a regular file takes the place of the link.
+- `isotope backup` copies `/oem`, so the store goes into a backup and comes
+  back with a restore.
 - The first boot has no generation. A file that is bad from the start is
   reported and left.
 - The message is in `isotope config status` and the journal. Nothing shows it

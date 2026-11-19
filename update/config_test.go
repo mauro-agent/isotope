@@ -15,6 +15,10 @@ import (
 // names one with "# user: NAME", the way the real boot stage writes
 // /etc/passwd from the cloud-config.
 const fakeConfigAgent = `#!/bin/sh
+# Strict mode also fails for what is not in the directory, such as a
+# config_url on the kernel command line that cannot be fetched.
+[ "$FAKE_AGENT" = always-fails ] && [ "$1" = run-stage ] && { printf '\t* could not fetch\n'; exit 1; }
+[ "$FAKE_AGENT" = crashes ] && [ "$1" = run-stage ] && exit 2
 case "$1" in
 config)
 	printf '#cloud-config\n\n# Sources:\n# - /oem/90_custom.yaml\n# - https://user:secret@example.com/c.yaml?token=abc\n#\nhostname: test\n'
@@ -416,5 +420,147 @@ func TestLineDiff(t *testing.T) {
 	want := "-   2  b|+   2  B|+   4  d"
 	if got != want {
 		t.Fatalf("lineDiff = %q, want %q", got, want)
+	}
+}
+
+// kairos-agent in strict mode fails for more than a bad file. A "no" that it
+// also gives to an empty directory, or a crash, is not a verdict on any file.
+func TestConfigANoThatIsNotAboutTheFilesChangesNothing(t *testing.T) {
+	for _, mode := range []string{"always-fails", "crashes"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newConfigFixture(t)
+			f.commit()
+			edited := goodUser + "# a good edit, not yet proven by a boot\n"
+			f.write("/oem/90_custom.yaml", edited, 0o600)
+			t.Setenv("FAKE_AGENT", mode)
+
+			events := f.e.guard()
+			if len(events) != 1 || events[0].Action != "skipped" {
+				t.Fatalf("guard = %+v, want skipped", events)
+			}
+			if f.read("/oem/90_custom.yaml") != edited {
+				t.Fatal("the guard replaced a good file on an answer that was not about it")
+			}
+			events, g := f.commit()
+			if g != nil || len(events) != 1 || events[0].Action != "not committed" {
+				t.Fatalf("commit = %+v %+v, want not committed: a config not known to load is not a generation", events, g)
+			}
+			if code, _ := f.run("check"); code != exitNoVerdict {
+				t.Fatalf("check = %d, want %d (no verdict)", code, exitNoVerdict)
+			}
+			cand := filepath.Join(t.TempDir(), "90_custom.yaml")
+			os.WriteFile(cand, []byte(goodUser), 0o600)
+			if code, _ := f.run("apply", cand); code != exitNoVerdict {
+				t.Fatalf("apply = %d, want %d (no verdict)", code, exitNoVerdict)
+			}
+			if f.read("/oem/90_custom.yaml") != edited {
+				t.Fatal("apply installed a file without a verdict")
+			}
+		})
+	}
+}
+
+func TestConfigGuardRunsOutOfTimeWithoutChangingAnything(t *testing.T) {
+	f := newConfigFixture(t)
+	f.commit()
+	f.write("/oem/90_custom.yaml", "BROKEN\n", 0o600)
+	f.e.Until = time.Now().Add(-time.Second)
+	if events := f.e.guard(); len(events) != 1 || events[0].Action != "skipped" {
+		t.Fatalf("guard = %+v, want skipped", events)
+	}
+	if f.read("/oem/90_custom.yaml") != "BROKEN\n" {
+		t.Fatal("the guard changed a file after its time was up")
+	}
+}
+
+// yip follows a link to a file, so a link is part of the config.
+func TestConfigScanFollowsALinkToAFile(t *testing.T) {
+	f := newConfigFixture(t)
+	f.write("/usr/local/real.txt", "BROKEN\n", 0o600)
+	if err := os.Symlink(f.e.real("/usr/local/real.txt"), f.e.real("/oem/95_link.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(f.e.real("/nowhere"), f.e.real("/oem/96_dangling.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	code, out := f.run("check")
+	if code != exitError || !strings.Contains(out, "BAD  /oem/95_link.yaml") || strings.Contains(out, "96_dangling") {
+		t.Fatalf("check = %d %q, want the link reported and the dangling one left out", code, out)
+	}
+}
+
+func TestConfigReplacedFilesKeepTheirPath(t *testing.T) {
+	f := newConfigFixture(t)
+	f.write("/oem/a__b.yaml", "one\n", 0o600)
+	f.write("/oem/a/b.yaml", "two\n", 0o600)
+	x, err := f.e.setAside("/oem/a__b.yaml", "stamp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := f.e.setAside("/oem/a/b.yaml", "stamp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x == y || f.read(x) != "one\n" || f.read(y) != "two\n" {
+		t.Fatalf("two replaced files share a copy: %s %s", x, y)
+	}
+	for _, p := range []string{x, y} {
+		if ext := filepath.Ext(p); ext == ".yaml" || ext == ".yml" {
+			t.Fatalf("the copy %s is a file Kairos would read", p)
+		}
+	}
+}
+
+func TestConfigApplyKeepsTheFileItReplaces(t *testing.T) {
+	f := newConfigFixture(t)
+	cand := filepath.Join(t.TempDir(), "new.yaml")
+	os.WriteFile(cand, []byte("name: new\n"), 0o600)
+	code, out := f.run("apply", cand, "--as", "90_custom.yaml")
+	if code != exitOK || f.read("/oem/90_custom.yaml") != "name: new\n" {
+		t.Fatalf("apply = %d %q", code, out)
+	}
+	saved, _ := filepath.Glob(f.e.real("/oem/.isotope-config/rejected/*/oem/90_custom.yaml.rejected"))
+	if len(saved) != 1 {
+		t.Fatalf("the replaced file was not kept: %v", saved)
+	}
+	if data, _ := os.ReadFile(saved[0]); string(data) != goodUser {
+		t.Fatalf("the kept file is not the one that was replaced: %q", data)
+	}
+	left, _ := filepath.Glob(f.e.real("/oem/.isotope-*"))
+	for _, l := range left {
+		if filepath.Base(l) != ".isotope-config" {
+			t.Fatalf("a temporary file was left in /oem: %s", l)
+		}
+	}
+}
+
+func TestConfigRollbackTakesItsFlagsInAnyOrder(t *testing.T) {
+	f := newConfigFixture(t)
+	f.commit()
+	changed := goodUser + "# changed\n"
+	f.write("/oem/90_custom.yaml", changed, 0o600)
+	// Declined (no answer on stdin): nothing changes, and it does not say ok.
+	if code, _ := f.run("rollback", "1"); code != exitError || f.read("/oem/90_custom.yaml") != changed {
+		t.Fatalf("a declined rollback = %d, or it changed the file", code)
+	}
+	if code, out := f.run("rollback", "1", "--yes"); code != exitOK || f.read("/oem/90_custom.yaml") != goodUser {
+		t.Fatalf("rollback 1 --yes = %d %q", code, out)
+	}
+	if code, _ := f.run("rollback", "1", "2"); code != exitUsage {
+		t.Fatalf("rollback with two generations = %d, want usage", code)
+	}
+}
+
+func TestConfigKeepsTheLastReplacedSets(t *testing.T) {
+	f := newConfigFixture(t)
+	for i := 0; i < configKeepRejected+4; i++ {
+		if _, err := f.e.setAside("/oem/90_custom.yaml", time.Unix(int64(i), 0).UTC().Format("20060102-150405")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.e.pruneRejected()
+	sets, _ := os.ReadDir(f.e.real("/oem/.isotope-config/rejected"))
+	if len(sets) != configKeepRejected || sets[0].Name() != "19700101-000004" {
+		t.Fatalf("kept %d sets, oldest %s", len(sets), sets[0].Name())
 	}
 }

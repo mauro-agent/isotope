@@ -12,6 +12,9 @@ ConditionPathExists=!/run/cos/recovery_mode
 
 [Service]
 Type=oneshot
+# It asks kairos-agent, which can wait for a network that is not there.
+# Never hold the boot for it: the command stops itself after 4 minutes.
+TimeoutStartSec=300
 ExecStart=/usr/bin/isotope config commit
 RemainAfterExit=yes
 
