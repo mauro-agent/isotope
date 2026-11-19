@@ -34,11 +34,11 @@ jobs:
           - variant: stock
             hadron: v0.6.5
             base: ghcr.io/kairos-io/hadron:v0.6.5
-            tag: sway-v0.0.22-arm64-2
+            tag: sway-v0.0.22-arm64-3
           - variant: reform
             hadron: v0.6.6
             base: ghcr.io/mauro-agent/hadron:v0.6.6-imx8mq-2
-            tag: sway-v0.0.22-imx8mq-1
+            tag: sway-v0.0.22-imx8mq-2
     env:
       HADRON_VERSION: ${{ matrix.hadron }}
       BASE_IMAGE: ${{ matrix.base }}
