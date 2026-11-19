@@ -1,0 +1,80 @@
+name: arm64 trial build
+
+# Fork-only trial. It proves that the Sway image builds on arm64. It runs on a
+# push to the trial branch and publishes test images to the registry of the
+# repository it runs in. Remove this file before the change goes upstream.
+on:
+  push:
+    branches: [feat/arm64-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ghcr.io/${{ github.repository }}
+  # <base release>-<label>. Change the label for every new test image.
+  TEST_TAG: sway-v0.0.22-arm64-1
+
+jobs:
+  llvm:
+    name: Prebuild LLVM (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log in to the registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Look for a published LLVM image
+        id: ref
+        run: |
+          image="${IMAGE_REPO}:$(make -s print-llvm-tag)-arm64"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push the LLVM image
+        if: steps.ref.outputs.found == 'false'
+        env:
+          LLVM_OUT: ${{ steps.ref.outputs.image }}
+        run: |
+          make llvm-image
+          docker push "$LLVM_OUT"
+
+  image:
+    name: Build the Sway image (arm64)
+    needs: llvm
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: write
+    env:
+      LLVM_IMAGE: ${{ needs.llvm.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log in to the registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Refuse to reuse a tag
+        run: |
+          if docker buildx imagetools inspect "${IMAGE_REPO}:${TEST_TAG}" >/dev/null 2>&1; then
+            echo "tag ${TEST_TAG} exists already, change TEST_TAG" >&2
+            exit 1
+          fi
+      - name: Build
+        run: make DESKTOP=sway GPU=full FIRMWARE=false IMAGE="${IMAGE_REPO}:${TEST_TAG}" image
+      - name: Show the architecture and the size
+        run: docker image inspect "${IMAGE_REPO}:${TEST_TAG}" --format '{{.Architecture}} {{.Size}}'
+      - name: Push
+        run: docker push "${IMAGE_REPO}:${TEST_TAG}"
