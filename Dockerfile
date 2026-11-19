@@ -2561,9 +2561,12 @@ RUN curl --retry-all-errors -fL --retry 5 https://github.com/Airblader/xcb-util-
     ./configure ${COMMON_CONFIGURE_ARGS} --disable-static && \
     make -j"$(nproc)" && make install && make install DESTDIR=/x11-libs
 
+# The 0.12 tarball is from 2011 and its config.guess and config.sub do not know
+# aarch64. Use the files of the toolchain instead.
 ARG STARTUP_NOTIFICATION_VERSION=0.12
 RUN curl --retry-all-errors -fL --retry 5 https://www.freedesktop.org/software/startup-notification/releases/startup-notification-${STARTUP_NOTIFICATION_VERSION}.tar.gz -o startup-notification.tar.gz && \
     tar -xf startup-notification.tar.gz && cd startup-notification-${STARTUP_NOTIFICATION_VERSION} && \
+    cp /usr/share/automake-*/config.guess /usr/share/automake-*/config.sub . && \
     ./configure --quiet --prefix=/usr --enable-shared --disable-static && \
     make -j"$(nproc)" && make install && make install DESTDIR=/x11-libs
 
