@@ -3,6 +3,10 @@ name: arm64 trial build
 # Fork-only trial. It proves that the Sway image builds on arm64. It runs on a
 # push to the trial branch and publishes test images to the registry of the
 # repository it runs in. Remove this file before the change goes upstream.
+#
+# Two variants build side by side:
+#   stock   the Hadron release that the Dockerfile pins, with its own base image
+#   reform  a newer Hadron release, on a base image that has a board kernel
 on:
   push:
     branches: [feat/arm64-build]
@@ -13,53 +17,32 @@ permissions:
 
 env:
   IMAGE_REPO: ghcr.io/${{ github.repository }}
-  # <base release>-<label>. Change the label for every new test image.
-  TEST_TAG: sway-v0.0.22-arm64-1
 
 jobs:
-  llvm:
-    name: Prebuild LLVM (arm64)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 350
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.ref.outputs.image }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Log in to the registry
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Look for a published LLVM image
-        id: ref
-        run: |
-          image="${IMAGE_REPO}:$(make -s print-llvm-tag)-arm64"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Build and push the LLVM image
-        if: steps.ref.outputs.found == 'false'
-        env:
-          LLVM_OUT: ${{ steps.ref.outputs.image }}
-        run: |
-          make llvm-image
-          docker push "$LLVM_OUT"
-
   image:
-    name: Build the Sway image (arm64)
-    needs: llvm
+    name: Build the Sway image (arm64, ${{ matrix.variant }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # <base release>-<label>. Change the label for every new test image.
+          - variant: stock
+            hadron: v0.6.5
+            base: ghcr.io/kairos-io/hadron:v0.6.5
+            tag: sway-v0.0.22-arm64-2
+          - variant: reform
+            hadron: v0.6.6
+            base: ghcr.io/mauro-agent/hadron:v0.6.6-imx8mq-2
+            tag: sway-v0.0.22-imx8mq-1
     env:
-      LLVM_IMAGE: ${{ needs.llvm.outputs.image }}
+      HADRON_VERSION: ${{ matrix.hadron }}
+      BASE_IMAGE: ${{ matrix.base }}
+      TEST_TAG: ${{ matrix.tag }}
     steps:
       - uses: actions/checkout@v7
       - name: Log in to the registry
@@ -69,12 +52,27 @@ jobs:
       - name: Refuse to reuse a tag
         run: |
           if docker buildx imagetools inspect "${IMAGE_REPO}:${TEST_TAG}" >/dev/null 2>&1; then
-            echo "tag ${TEST_TAG} exists already, change TEST_TAG" >&2
+            echo "tag ${TEST_TAG} exists already, change the tag" >&2
             exit 1
           fi
+      - name: Build and push the LLVM image when it is not published
+        run: |
+          image="${IMAGE_REPO}:$(make -s HADRON_VERSION="$HADRON_VERSION" print-llvm-tag)-arm64"
+          echo "LLVM_IMAGE=$image" >> "$GITHUB_ENV"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "found $image"
+            exit 0
+          fi
+          make HADRON_VERSION="$HADRON_VERSION" LLVM_OUT="$image" llvm-image
+          docker push "$image"
       - name: Build
-        run: make DESKTOP=sway GPU=full FIRMWARE=false IMAGE="${IMAGE_REPO}:${TEST_TAG}" image
-      - name: Show the architecture and the size
-        run: docker image inspect "${IMAGE_REPO}:${TEST_TAG}" --format '{{.Architecture}} {{.Size}}'
+        run: |
+          make DESKTOP=sway GPU=full FIRMWARE=false \
+            HADRON_VERSION="$HADRON_VERSION" BASE_IMAGE="$BASE_IMAGE" \
+            IMAGE="${IMAGE_REPO}:${TEST_TAG}" image
+      - name: Show the architecture, the size and the kernel
+        run: |
+          docker image inspect "${IMAGE_REPO}:${TEST_TAG}" --format '{{.Architecture}} {{.Size}}'
+          docker run --rm --entrypoint /bin/sh "${IMAGE_REPO}:${TEST_TAG}" -c 'ls -l /boot /boot/dtb/* 2>/dev/null; ls /usr/lib/modules'
       - name: Push
         run: docker push "${IMAGE_REPO}:${TEST_TAG}"
