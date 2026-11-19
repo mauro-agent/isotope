@@ -4829,7 +4829,7 @@ COPY rootfs/usr/lib/dracut/ /usr/lib/dracut/
 COPY rootfs/etc/vconsole.conf /etc/vconsole.conf
 COPY rootfs/etc/kairos/ /etc/kairos/
 COPY rootfs/usr/libexec/isotope-grub-theme /usr/libexec/isotope-grub-theme
-COPY rootfs/system/oem/08_isotope_rename.yaml rootfs/system/oem/09_isotope_grub_theme.yaml rootfs/system/oem/10_isotope_grub_env.yaml rootfs/system/oem/11_isotope_efi_boot_entry.yaml /system/oem/
+COPY rootfs/system/oem/07_isotope_config_guard.yaml rootfs/system/oem/08_isotope_rename.yaml rootfs/system/oem/09_isotope_grub_theme.yaml rootfs/system/oem/10_isotope_grub_env.yaml rootfs/system/oem/11_isotope_efi_boot_entry.yaml /system/oem/
 # The installer, and system extensions.
 COPY rootfs/system/oem/90_desktop_installer.yaml rootfs/system/oem/93_isotope_extensions.yaml /system/oem/
 COPY rootfs/etc/isotope/extensions.conf /etc/isotope/extensions.conf
@@ -4849,7 +4849,7 @@ COPY rootfs/usr/share/dbus-1/ /usr/share/dbus-1/
 COPY rootfs/usr/share/polkit-1/ /usr/share/polkit-1/
 # Backups: the daily timer of `isotope backup --scheduled`, and the one-shot
 # after a whole restore.
-COPY rootfs/usr/lib/systemd/system/isotope-backup.service rootfs/usr/lib/systemd/system/isotope-backup.timer rootfs/usr/lib/systemd/system/isotope-restore-finish.service /usr/lib/systemd/system/
+COPY rootfs/usr/lib/systemd/system/isotope-backup.service rootfs/usr/lib/systemd/system/isotope-backup.timer rootfs/usr/lib/systemd/system/isotope-restore-finish.service rootfs/usr/lib/systemd/system/isotope-config-commit.service /usr/lib/systemd/system/
 # Docker: its units, and the boot stage that persists /var/lib/docker and
 # starts the daemon on the installed system only.
 COPY rootfs/usr/lib/systemd/system/docker.service rootfs/usr/lib/systemd/system/docker.socket /usr/lib/systemd/system/
@@ -5255,6 +5255,11 @@ COPY --from=restic /restic/ /
 RUN systemctl enable isotope-backup.timer isotope-restore-finish.service && \
     test -L /etc/systemd/system/timers.target.wants/isotope-backup.timer && \
     test -L /etc/systemd/system/multi-user.target.wants/isotope-restore-finish.service
+# The cloud-config safety net: `isotope config commit` records each boot that
+# left a user who can log in, and goes back to the last one when a boot left
+# none. Its guard is /system/oem/07_isotope_config_guard.yaml.
+RUN systemctl enable isotope-config-commit.service && \
+    test -L /etc/systemd/system/multi-user.target.wants/isotope-config-commit.service
 
 
 # The server edition's image. Keep the binaries at the end in step with
@@ -5313,6 +5318,11 @@ COPY --from=restic /restic/ /
 RUN systemctl enable isotope-backup.timer isotope-restore-finish.service && \
     test -L /etc/systemd/system/timers.target.wants/isotope-backup.timer && \
     test -L /etc/systemd/system/multi-user.target.wants/isotope-restore-finish.service
+# The cloud-config safety net: `isotope config commit` records each boot that
+# left a user who can log in, and goes back to the last one when a boot left
+# none. Its guard is /system/oem/07_isotope_config_guard.yaml.
+RUN systemctl enable isotope-config-commit.service && \
+    test -L /etc/systemd/system/multi-user.target.wants/isotope-config-commit.service
 
 # The image the kairos stage turns bootable: the desktop for sway, i3, cosmic
 # and niri, the server edition for server.

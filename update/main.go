@@ -59,6 +59,9 @@ Commands:
   backup [command]  back up this machine to a USB disk or a server; see
                     "isotope backup help"
   restore           restore a backup; see "isotope restore help"
+  config [command]  the cloud-config of this machine: check a file before a
+                    restart, see what changed, go back to the last good one;
+                    see "isotope config help"
   help              this text
 
 Started by the desktop session and by systemd, not by hand:
@@ -125,6 +128,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdBackup(args, stdin, stdout, stderr)
 	case "restore":
 		return cmdRestore(args, stdin, stdout, stderr)
+	case "config":
+		return cmdConfig(args, stdin, stdout, stderr)
 	case "daemon":
 		return cmdDaemon(args, stderr)
 	case "efi-boot-entry":

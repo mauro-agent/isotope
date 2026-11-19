@@ -137,6 +137,25 @@ isotope switch niri            # change to another desktop
 Only members of the `admin` group can install updates. Release images are
 signed with [cosign](https://github.com/sigstore/cosign).
 
+## The cloud-config
+
+Kairos applies the cloud-config in `/oem` again on every boot, and skips a
+file that does not load, with the users in it. `isotope config` keeps one
+wrong line from locking you out. It records the files of every boot that
+ended with a user who can log in. At the next boot, a file that no longer
+loads is set aside and its last good copy is put back, and a config that
+leaves no user is rolled back.
+
+```sh
+sudo isotope config check            # will Kairos load every file?
+sudo isotope config apply my.yaml    # check a file, then install it in /oem
+sudo isotope config status           # the fingerprint, what changed, what the last boot repaired
+sudo isotope config diff             # the changes since the last good boot
+sudo isotope config rollback         # go back to it
+```
+
+See [the design](docs/superpowers/specs/2026-11-19-config-safe-apply-design.md).
+
 ## Backups
 
 An update cannot break the system, but a disk can die and a laptop can get

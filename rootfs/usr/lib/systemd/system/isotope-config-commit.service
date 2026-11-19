@@ -1,0 +1,19 @@
+[Unit]
+Description=Isotope config: record a good boot, or go back to the last good config
+# After Kairos has applied the cloud-config: /etc/passwd is written again on
+# every boot by the cos-setup boot stage, so whether a user can log in is only
+# known once it has run. A boot that left one becomes the new last good
+# generation; a boot that left none, when the last good one had a user, puts
+# that generation's files back and runs their boot stage again.
+After=cos-setup-boot.service
+ConditionPathExists=/etc/passwd
+ConditionPathExists=!/run/cos/live_mode
+ConditionPathExists=!/run/cos/recovery_mode
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/isotope config commit
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

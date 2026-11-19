@@ -1,0 +1,31 @@
+# Keep one bad cloud-config file from locking the user out.
+#
+# Kairos runs the cloud-config one file at a time and skips, as a whole, a
+# file that does not load. When that file is the one that holds the user,
+# nobody can log in, and /oem is the same on every boot entry, so the fallback
+# and the recovery system have the same file.
+#
+# `isotope config guard` loads each file of /oem and /usr/local/cloud-config
+# with kairos-agent's own loader. A file that no longer loads is set aside
+# under /oem/.isotope-config/rejected and the copy from the last good boot is
+# put back. `isotope config status` then says what happened.
+#
+# This file is in /system/oem, which is part of the image and which Kairos
+# reads before /oem in every stage, so the guard runs before Kairos reads the
+# files it repairs. It runs before the initramfs stage (the first one after
+# the root is mounted, where the hostname, the keyboard and the login screen
+# are set) and again before the boot stage, where the users are created.
+# The guard always exits 0: when it cannot tell, it changes nothing.
+#
+# See docs/superpowers/specs/2026-11-19-config-safe-apply-design.md.
+name: "Isotope config guard"
+stages:
+    initramfs.before:
+    - &guard
+      name: "Put back the last good copy of a cloud-config that does not load"
+      if: '[ -x /usr/bin/isotope ] && [ ! -f /run/cos/live_mode ]'
+      commands:
+      - /usr/bin/isotope config guard || true
+
+    boot.before:
+    - <<: *guard
