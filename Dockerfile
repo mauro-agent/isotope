@@ -265,7 +265,7 @@ RUN mkdir -p /mesa
 WORKDIR /build
 RUN curl --retry 5 --retry-delay 3 --retry-all-errors -L https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz -o mesa.tar.xz && tar -xf mesa.tar.xz && rm mesa.tar.xz && mv mesa-* mesa-src
 WORKDIR /build/mesa-src
-RUN pip3 install meson ninja setuptools mako pyyaml
+RUN pip3 install meson ninja setuptools mako pyyaml pycparser
 # Every mode builds llvmpipe, the software rasterizer Mesa picks for any
 # display it has no GPU driver for: a VM without 3D (virtio-gpu, QXL, -vga
 # std) or, with GPU=vm, real hardware. softpipe stays as a fallback that
@@ -2631,7 +2631,7 @@ WORKDIR /build
 RUN curl --retry 5 --retry-delay 3 --retry-all-errors -fL https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz -o mesa.tar.xz && \
     tar -xf mesa.tar.xz && mv mesa-* src
 WORKDIR /build/src
-RUN pip3 install meson ninja setuptools mako pyyaml
+RUN pip3 install meson ninja setuptools mako pyyaml pycparser
 RUN if [ "$GPU" = "full" ]; then \
       DRV="iris,radeonsi,nouveau,llvmpipe,virgl,softpipe,svga"; \
     else \
