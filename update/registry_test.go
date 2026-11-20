@@ -78,6 +78,29 @@ func TestResolveRefusesOtherPlatforms(t *testing.T) {
 	}
 }
 
+// The other tests in this package publish amd64 images, so they name an
+// amd64 machine whatever the machine that runs them.
+func init() { imageGOARCH = "amd64" }
+
+func TestResolveFollowsTheMachineArchitecture(t *testing.T) {
+	old := imageGOARCH
+	imageGOARCH = "arm64"
+	t.Cleanup(func() { imageGOARCH = old })
+	for name, index := range map[string]bool{"index": true, "single manifest": false} {
+		t.Run(name, func(t *testing.T) {
+			want := fakeImage(t, "isotope", "sway-v1", "arm64", nil, index)
+			got, err := Resolve(context.Background(), mustRef(t, testImage))
+			if err != nil || got.Digest != want || got.Arch != "arm64" {
+				t.Fatalf("got %+v, %v; want digest %s", got, err, want)
+			}
+		})
+	}
+	fakeImage(t, "isotope", "sway-v1", "amd64", nil, false)
+	if _, err := Resolve(context.Background(), mustRef(t, testImage)); !errors.Is(err, ErrWrongPlatform) {
+		t.Fatalf("err = %v, want ErrWrongPlatform", err)
+	}
+}
+
 func TestResolvePrivate(t *testing.T) {
 	fakeRegistry(t, true)
 	_, err := Resolve(context.Background(), mustRef(t, testImage))

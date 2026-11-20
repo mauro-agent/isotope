@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -162,9 +163,13 @@ func tokenRealmAllowed(realm string) bool {
 // anonymous on purpose, so a private image is refused, not prompted for.
 var ErrNeedsCredentials = errors.New("needs registry credentials")
 
-// ErrWrongPlatform means the image has no linux/amd64 build, the only
-// platform Isotope runs on.
-var ErrWrongPlatform = errors.New("image is not built for linux/amd64")
+// ErrWrongPlatform means the image has no Linux build for the architecture
+// of this machine.
+var ErrWrongPlatform = errors.New("image is not built for linux/" + runtime.GOARCH)
+
+// imageGOARCH is the image architecture an install accepts: the one this
+// machine runs. A variable so a test can name another machine.
+var imageGOARCH = runtime.GOARCH
 
 // ImageInfo is what an install needs to know about an image. Digest is the
 // digest of what the reference points at (the index for a multi-arch image),
@@ -211,7 +216,7 @@ func Resolve(ctx context.Context, ref ImageRef) (ImageInfo, error) {
 	if len(m.Manifests) > 0 {
 		child := ""
 		for _, e := range m.Manifests {
-			if e.Platform.OS == "linux" && e.Platform.Architecture == "amd64" {
+			if e.Platform.OS == "linux" && e.Platform.Architecture == imageGOARCH {
 				child = e.Digest
 				break
 			}
@@ -253,7 +258,7 @@ func Resolve(ctx context.Context, ref ImageRef) (ImageInfo, error) {
 		return ImageInfo{}, fmt.Errorf("%s: unreadable image config: %w", ref, err)
 	}
 	info.OS, info.Arch, info.Labels = cfg.OS, cfg.Architecture, cfg.Config.Labels
-	if info.OS != "linux" || info.Arch != "amd64" {
+	if info.OS != "linux" || info.Arch != imageGOARCH {
 		return ImageInfo{}, fmt.Errorf("%s is %s/%s: %w", ref, info.OS, info.Arch, ErrWrongPlatform)
 	}
 	return info, nil
