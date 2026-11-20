@@ -37,7 +37,9 @@ jobs:
           - variant: reform
             hadron: v0.6.6
             base: ghcr.io/mauro-agent/hadron:v0.6.6-imx8mq-3
-            tag: sway-v0.0.22-imx8mq-3
+            tag: sway-v0.0.22-imx8mq-4
+            # The board kernel arguments go on top, as <tag>a.
+            args: true
     env:
       HADRON_VERSION: ${{ matrix.hadron }}
       BASE_IMAGE: ${{ matrix.base }}
@@ -75,3 +77,9 @@ jobs:
           docker run --rm --entrypoint /bin/sh "${IMAGE_REPO}:${TEST_TAG}" -c 'ls -l /boot /boot/dtb/* 2>/dev/null; ls /usr/lib/modules'
       - name: Push
         run: docker push "${IMAGE_REPO}:${TEST_TAG}"
+      - name: Add the board kernel arguments and push
+        if: matrix.args
+        run: |
+          docker build --build-arg FROM_IMAGE="${IMAGE_REPO}:${TEST_TAG}" \
+            -t "${IMAGE_REPO}:${TEST_TAG}a" .github/reform-args
+          docker push "${IMAGE_REPO}:${TEST_TAG}a"
