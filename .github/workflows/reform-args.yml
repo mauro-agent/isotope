@@ -1,0 +1,41 @@
+name: reform kernel arguments
+
+# Fork-only trial. It puts the board kernel arguments on top of an image that
+# the arm64 trial published. Remove this file before the change goes upstream.
+on:
+  push:
+    branches: [feat/arm64-build]
+    paths: ['.github/reform-args/**']
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ghcr.io/${{ github.repository }}
+
+jobs:
+  layer:
+    name: Add the board kernel arguments
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log in to the registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push
+        run: |
+          read -r from to < <(grep -v '^#' .github/reform-args/tags | tail -n 1)
+          if docker buildx imagetools inspect "${IMAGE_REPO}:${to}" >/dev/null 2>&1; then
+            echo "tag ${to} exists already, change the tag" >&2
+            exit 1
+          fi
+          docker build --build-arg FROM_IMAGE="${IMAGE_REPO}:${from}" \
+            -t "${IMAGE_REPO}:${to}" .github/reform-args
+          docker run --rm --entrypoint /bin/sh "${IMAGE_REPO}:${to}" -c \
+            'grep -n "ttymxc0" /etc/cos/bootargs.cfg; ls /boot/dtb/freescale; find /usr/lib/modules -name "reform2_lpc*"'
+          docker push "${IMAGE_REPO}:${to}"

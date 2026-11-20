@@ -10,6 +10,7 @@ name: arm64 trial build
 on:
   push:
     branches: [feat/arm64-build]
+    paths-ignore: ['.github/reform-args/**', '.github/workflows/reform-args.yml']
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,3 @@
+# <source tag> <new tag>. A push that changes this file builds the new tag.
+# A tag is never reused.
+sway-v0.0.22-imx8mq-3 sway-v0.0.22-imx8mq-3a
