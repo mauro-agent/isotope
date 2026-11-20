@@ -31,14 +31,12 @@ jobs:
       matrix:
         include:
           # <base release>-<label>. Change the label for every new test image.
-          - variant: stock
-            hadron: v0.6.5
-            base: ghcr.io/kairos-io/hadron:v0.6.5
-            tag: sway-v0.0.22-arm64-3
+          # The stock variant (Hadron v0.6.5) is published as sway-v0.0.22-arm64-3.
+          # Add it again with a new tag to build it once more.
           - variant: reform
             hadron: v0.6.6
-            base: ghcr.io/mauro-agent/hadron:v0.6.6-imx8mq-2
-            tag: sway-v0.0.22-imx8mq-2
+            base: ghcr.io/mauro-agent/hadron:v0.6.6-imx8mq-3
+            tag: sway-v0.0.22-imx8mq-3
     env:
       HADRON_VERSION: ${{ matrix.hadron }}
       BASE_IMAGE: ${{ matrix.base }}
